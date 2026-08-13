@@ -4,7 +4,7 @@ A retrieval-augmented generation pipeline over a corpus of computer vision paper
 
 Runs entirely locally. No API keys, no paid services.
 
-> **Status:** in progress. Full pipeline working end to end — ingestion, embedding, vector search, and grounded generation. Evaluation harness and controlled comparison in development. Findings below come from real runs.
+> **Status:** in progress. Full pipeline working end to end — ingestion, embedding, vector search, and grounded generation. Evaluation harness and controlled comparison in development. Findings below come from real runs, including the ones that didn't work.
 
 ---
 
@@ -15,7 +15,7 @@ A single end-to-end accuracy number tells you a RAG system failed without tellin
 - **Retrieval failed** — the answer was never in the context. Fix chunking, embeddings, or `k`.
 - **Generation failed** — the answer was in the context and the model ignored it, or blended it with parametric knowledge. Fix the prompt or the model.
 
-This is not a theoretical concern in this project. **Finding 3 below is a case where retrieval ranked the correct chunk second behind an unrelated one, and generation recovered anyway** — end-to-end accuracy was 1.0 while `recall@1` was 0. A single aggregate number would have reported success and hidden a real retrieval problem.
+This is not a theoretical concern here. **Finding 3 below is a case where retrieval ranked the correct chunk second behind an unrelated one, and generation recovered anyway** — end-to-end accuracy was 1.0 while `recall@1` was 0. A single aggregate number would have reported success and hidden a real retrieval problem.
 
 ---
 
@@ -61,11 +61,12 @@ done
 cd ../..
 ```
 
-Ingest and query:
+Ingest, query, inspect:
 
 ```bash
 python -m src.ingest --reset
 python -m src.generate
+python -m eval.inspect --search "your question here" -k 5
 ```
 
 ---
@@ -76,12 +77,12 @@ python -m src.generate
 
 Recursive character splitting on paragraph, line, sentence, then word boundaries, with configurable overlap. Chunk size is a **variable in the comparison below**, not a value copied from a tutorial, because the tradeoff is real: small chunks retrieve precisely but sever context; large chunks preserve context but produce embeddings averaged over too many ideas.
 
-Current corpus at `chunk_size=512, overlap=50`:
+Corpus at `chunk_size=512, overlap=50`, references stripped:
 
 ```
 papers: 10
-chunks: 224
-avg words/chunk: 421
+chunks: 188
+avg words/chunk: 415
 min: 63   max: 562
 ```
 
@@ -116,17 +117,17 @@ Top-5 for *"How does U-Net handle limited training data?"*:
 
 | Rank | Similarity | Source | Relevant |
 |---|---|---|---|
-| 1 | 0.504 | ResNet (1512.03385) #9 | No — convergence rates, optimization difficulty |
-| 2 | 0.502 | **U-Net (1505.04597) #1** | **Yes** — "thousands of training images are usually beyond reach in biomedical tasks" |
-| 3 | 0.489 | SimCLR (2002.05709) #13 | No — results table |
-| 4 | 0.486 | ResNet (1512.03385) #14 | No — 110-layer convergence |
-| 5 | 0.451 | U-Net (1505.04597) #7 | Partial — elastic deformation |
+| 1 | 0.504 | ResNet #9 | No — convergence rates, optimization difficulty |
+| 2 | 0.502 | **U-Net #1** | **Yes** — "thousands of training images are usually beyond reach in biomedical tasks" |
+| 3 | 0.489 | SimCLR #13 | No — results table |
+| 4 | 0.486 | ResNet #14 | No — 110-layer convergence |
+| 5 | 0.451 | U-Net #7 | Partial — reference section |
 
 The correct chunk ranks **second, behind an unrelated ResNet chunk, by 0.002**. `recall@1` is 0 for this query while `recall@5` is 1. Two ResNet chunks appear in the top five for a question about U-Net and training data, and the total spread across the top five is 0.053 — the embedder is barely discriminating between relevant and irrelevant in-domain text.
 
 ### Grounded generation
 
-Llama 3.1 8B via Ollama at `temperature=0`. The system prompt requires the model to answer only from numbered context passages, cite passage numbers per claim, and emit `INSUFFICIENT_CONTEXT` when the context cannot support an answer. Citations exist so that unsupported claims are visible to the faithfulness metric.
+Llama 3.1 8B via Ollama at `temperature=0`. The system prompt requires the model to answer only from numbered context passages, cite passage numbers per claim, and emit `INSUFFICIENT_CONTEXT` when the context cannot support an answer. Citations exist so unsupported claims are visible to the faithfulness metric.
 
 **Finding 3 — generation compensated for a retrieval failure, which is the case for separate metrics.**
 
@@ -136,7 +137,7 @@ On the U-Net query above, the correct chunk was ranked second behind a higher-sc
 
 End-to-end this looks like success. Measured separately, `recall@1` is 0 — retrieval failed and generation covered for it. Reporting only end-to-end accuracy would have hidden that entirely.
 
-The answer is also incomplete: it names the outcome but not the mechanism (elastic deformation and data augmentation), which appeared only partially in chunk [5] and went uncited. Retrieval surfaced the right *topic* without the specific supporting passage.
+The answer is also incomplete: it names the outcome but not the mechanism (elastic deformation and data augmentation), which appeared only partially in a lower-ranked chunk and went uncited. Retrieval surfaced the right *topic* without the specific supporting passage.
 
 **Finding 4 — abstention held under plausible-but-wrong context, and retrieval scores signalled the out-of-corpus case.**
 
@@ -149,7 +150,36 @@ Retrieval similarity also separated the two cases:
 | Answerable from corpus | 0.50 |
 | Not in corpus | 0.45 |
 
-The margin is small but consistent, suggesting a score threshold could act as a cheap pre-generation filter. This is testable and is added to the comparison below.
+The margin is small but consistent, suggesting a score threshold could act as a cheap pre-generation filter. Added to the comparison below as a testable variant.
+
+### Ingestion hygiene
+
+Inspecting chunks revealed that reference sections were being embedded as ordinary content. One U-Net chunk was 433 words consisting of a single line of body text followed by fourteen numbered citations and two URLs, and it had placed 5th for the U-Net query. Reference sections name every topic in a field without discussing any of them, so the hypothesis was that they embed as broadly relevant and displace real content.
+
+`strip_references()` cuts from the references/acknowledgements heading onward, restricted to the last 40% of a document so that in-body mentions are not matched. Controlled with `--keep-refs`.
+
+**Finding 5 — removing 16% of the corpus as noise did not change retrieval.**
+
+| | Chunks | Avg words |
+|---|---|---|
+| References kept | 224 | 421 |
+| References stripped | **188** | 415 |
+
+Same query, before and after:
+
+| Rank | Before | After |
+|---|---|---|
+| 1 | 0.504 ResNet #9 | 0.504 ResNet #9 |
+| 2 | 0.502 **U-Net #1** | 0.502 **U-Net #1** |
+| 3 | 0.489 SimCLR #13 | 0.489 SimCLR #13 |
+| 4 | 0.486 ResNet #14 | 0.486 ResNet #14 |
+| 5 | 0.451 U-Net #7 *(references)* | 0.441 ResNet #13 *(CIFAR results table)* |
+
+Ranks 1 through 4 are identical to three decimal places. The bibliography chunk was evicted from position 5 and replaced by a ResNet CIFAR-10 results table — also irrelevant to the question.
+
+The intervention did exactly what it was designed to do and produced no measurable improvement, because removing noise from the candidate pool does not help when the remaining pool contains equally irrelevant candidates. The bottleneck is the embedder's discrimination, not corpus hygiene.
+
+The change is retained: 16% fewer vectors at no cost to ranking is worth having. But it rules out the cheap explanation and confirms that the embedding-model, hybrid-retrieval, and reranking variants are the experiment that matters.
 
 ### Evaluation harness — *in progress*
 
@@ -171,6 +201,7 @@ One variable at a time, everything else fixed, so any difference is attributable
 | Hybrid (RRF) | 512 | 5 | dense + BM25 | — | — | — | — | — |
 | Hybrid + rerank | 512 | 5 | dense + BM25 + cross-encoder | — | — | — | — | — |
 | Score threshold | 512 | 5 | dense + similarity cutoff | — | — | — | — | — |
+| References kept | 512 | 5 | dense (MiniLM), no ref stripping | — | — | — | — | — |
 
 ---
 
@@ -193,13 +224,14 @@ Abstention is measured deliberately. Llama 3.1 8B abstains correctly on unknown-
 
 ```
 src/
-  chunker.py       PDF to cleaned text to overlapping chunks
+  chunker.py       PDF to cleaned text to overlapping chunks, reference stripping
   embedder.py      text to normalised vectors (MPS-accelerated)
   store.py         ChromaDB persistence and k-NN search
   ingest.py        chunk, embed, and load the corpus
   generate.py      retrieved context + question to grounded answer
   app.py           FastAPI service
 eval/
+  inspect.py       browse and search chunks when writing the eval set
   questions.jsonl  hand-written eval set with known source chunks
   metrics.py       retrieval + generation metrics
   run.py           runs one config, logs per-variant results
@@ -216,8 +248,8 @@ data/chroma/       vector store (not committed, regenerable)
 - The eval set is hand-written and small, so differences of a few points are not meaningful.
 - Faithfulness scoring uses LLM-as-judge, which is imperfect and correlated with the generator.
 - Chunks exceeding the embedder's 512-token limit are silently truncated.
-- At 224 chunks Chroma uses exact search; results may shift once approximate nearest-neighbour indexing kicks in at scale.
-- Findings 3 and 4 are single-query observations, not measured rates. Quantifying them across the full eval set is the purpose of the harness.
+- At 188 chunks Chroma uses exact search; results may shift once approximate nearest-neighbour indexing kicks in at scale.
+- Findings 2 through 5 are single-query observations, not measured rates. Quantifying them across the full eval set is the purpose of the harness.
 
 ---
 
