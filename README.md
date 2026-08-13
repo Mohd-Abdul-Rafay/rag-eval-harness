@@ -4,7 +4,7 @@ A retrieval-augmented generation pipeline over a corpus of computer vision paper
 
 Runs entirely locally. No API keys, no paid services.
 
-> **Status:** in progress. Ingestion and embedding complete; vector store, generation, and evaluation in development. Findings below come from real runs, not expectations.
+> **Status:** in progress. Ingestion, embedding, and vector search complete; generation and the evaluation harness in development. Findings below come from real runs, not expectations.
 
 ---
 
@@ -25,7 +25,7 @@ Conflating them means guessing. So retrieval is measured with `recall@k` and MRR
 |---|---|---|
 | Generation | Ollama + Llama 3.1 8B | Local, free, fast enough for hundreds of eval calls |
 | Embeddings | sentence-transformers (`all-MiniLM-L6-v2`) | 384-dim, runs on Apple MPS |
-| Vector store | ChromaDB | Local persistence, no server |
+| Vector store | ChromaDB | Local persistence, cosine space, no server |
 | Serving | FastAPI | |
 | Corpus | 10 arXiv CV papers | ResNet, Transformer, ViT, Swin, SimCLR, EfficientNet, U-Net, YOLO, Focal Loss, DETR |
 
@@ -61,6 +61,12 @@ done
 cd ../..
 ```
 
+Ingest:
+
+```bash
+python -m src.ingest --reset
+```
+
 ---
 
 ## Build log
@@ -68,10 +74,6 @@ cd ../..
 ### Chunking
 
 Recursive character splitting on paragraph, line, sentence, then word boundaries, with configurable overlap. Chunk size is a **variable in the comparison below**, not a value copied from a tutorial, because the tradeoff is real: small chunks retrieve precisely but sever context; large chunks preserve context but produce embeddings averaged over too many ideas.
-
-```bash
-python src/chunker.py
-```
 
 Current corpus at `chunk_size=512, overlap=50`:
 
@@ -88,11 +90,7 @@ The average falls below target because the splitter respects paragraph boundarie
 
 `all-MiniLM-L6-v2`, 384 dimensions, running on Apple MPS. Vectors are normalised so cosine similarity reduces to a dot product.
 
-```bash
-python src/embedder.py
-```
-
-**Finding — the baseline embedder does not separate in-domain topics well.**
+**Finding 1 — the baseline embedder does not separate in-domain topics well.**
 
 Cosine similarity across four probe sentences:
 
@@ -107,9 +105,27 @@ The intended result is visible: **s0 to s1 scores 0.463** despite near-zero voca
 
 The unintended result is more useful. **s1 to s3 scores 0.453** — "residual connections allow training of very deep networks" is judged nearly as relevant to the U-Net question as the actually-correct answer, despite being unrelated. A 6-layer general-purpose embedder appears to encode *topic* ("this is a deep learning sentence") more strongly than the specific semantic relation being asked about.
 
-This motivates three things that follow: comparing `all-mpnet-base-v2` against the baseline, cross-encoder reranking (which scores query and candidate jointly rather than independently), and hybrid retrieval with BM25 to recover exact-term matching.
+### Vector store and retrieval
 
-### Vector store — *in progress*
+ChromaDB with a persistent local client, cosine space. Chroma returns cosine *distance*; the store converts to similarity explicitly, since getting that inversion wrong would silently reverse every ranking.
+
+**Finding 2 — the probe-level failure reproduces in the full pipeline.**
+
+Top-5 for *"How does U-Net handle limited training data?"*:
+
+| Rank | Similarity | Source | Relevant |
+|---|---|---|---|
+| 1 | 0.504 | ResNet (1512.03385) #9 | No — convergence rates, optimization difficulty |
+| 2 | 0.502 | **U-Net (1505.04597) #1** | **Yes** — "thousands of training images are usually beyond reach in biomedical tasks" |
+| 3 | 0.489 | SimCLR (2002.05709) #13 | No — results table |
+| 4 | 0.486 | ResNet (1512.03385) #14 | No — 110-layer convergence |
+| 5 | 0.451 | U-Net (1505.04597) #7 | Partial — elastic deformation |
+
+The correct chunk ranks **second, behind an unrelated ResNet chunk, by 0.002**. `recall@1` is 0 for this query while `recall@5` is 1 — which is precisely why retrieval is measured at multiple values of *k* rather than reported as a single hit rate.
+
+Two ResNet chunks appear in the top five for a question about U-Net and training data. The total spread across the top five is 0.053, indicating the embedder is barely discriminating between relevant and irrelevant in-domain text.
+
+These two findings motivate the retrieval variants tested below: a larger embedding model (`all-mpnet-base-v2`), sparse BM25 retrieval to recover exact-term matching, hybrid fusion, and cross-encoder reranking, which scores query and candidate jointly rather than embedding them independently.
 
 ### Generation — *in progress*
 
@@ -121,24 +137,24 @@ This motivates three things that follow: comparing `all-mpnet-base-v2` against t
 
 One variable at a time, everything else fixed, so any difference is attributable to a single change.
 
-| Variant | Chunk size | Top-k | Retrieval | recall@5 | MRR | Faithfulness | Abstention |
-|---|---|---|---|---|---|---|---|
-| Baseline | 512 | 5 | dense (MiniLM) | — | — | — | — |
-| Chunk 256 | 256 | 5 | dense (MiniLM) | — | — | — | — |
-| Chunk 1024 | 1024 | 5 | dense (MiniLM) | — | — | — | — |
-| Top-k 3 | 512 | 3 | dense (MiniLM) | — | — | — | — |
-| Top-k 10 | 512 | 10 | dense (MiniLM) | — | — | — | — |
-| Larger embedder | 512 | 5 | dense (mpnet) | — | — | — | — |
-| BM25 only | 512 | 5 | sparse | — | — | — | — |
-| Hybrid (RRF) | 512 | 5 | dense + BM25 | — | — | — | — |
-| Hybrid + rerank | 512 | 5 | dense + BM25 + cross-encoder | — | — | — | — |
+| Variant | Chunk size | Top-k | Retrieval | recall@1 | recall@5 | MRR | Faithfulness | Abstention |
+|---|---|---|---|---|---|---|---|---|
+| Baseline | 512 | 5 | dense (MiniLM) | — | — | — | — | — |
+| Chunk 256 | 256 | 5 | dense (MiniLM) | — | — | — | — | — |
+| Chunk 1024 | 1024 | 5 | dense (MiniLM) | — | — | — | — | — |
+| Top-k 3 | 512 | 3 | dense (MiniLM) | — | — | — | — | — |
+| Top-k 10 | 512 | 10 | dense (MiniLM) | — | — | — | — | — |
+| Larger embedder | 512 | 5 | dense (mpnet) | — | — | — | — | — |
+| BM25 only | 512 | 5 | sparse | — | — | — | — | — |
+| Hybrid (RRF) | 512 | 5 | dense + BM25 | — | — | — | — | — |
+| Hybrid + rerank | 512 | 5 | dense + BM25 + cross-encoder | — | — | — | — | — |
 
 ---
 
 ## Metrics
 
 **Retrieval**
-- `recall@k` — is the known source chunk in the top *k*?
+- `recall@k` — is the known source chunk in the top *k*? Reported at k=1 and k=5, since Finding 2 shows those can diverge.
 - `MRR` — mean reciprocal rank of the correct chunk.
 
 **Generation**
@@ -146,7 +162,7 @@ One variable at a time, everything else fixed, so any difference is attributable
 - **Answer relevance** — does it address the question asked?
 - **Abstention correctness** — when the context genuinely lacks the answer, does the model say so instead of inventing one?
 
-Abstention is measured deliberately. Llama 3.1 8B abstains correctly on unknown-entity questions *without* retrieval — asked about a nonexistent paper, it replied that the work "may not exist at all." The failure mode that matters in RAG is different: plausible-but-wrong retrieved context making the model confident when it should not be. The eval set includes questions targeting exactly that.
+Abstention is measured deliberately. Llama 3.1 8B abstains correctly on unknown-entity questions *without* retrieval — asked about a nonexistent paper, it replied that the work "may not exist at all." The failure mode that matters in RAG is different, and Finding 2 shows why: retrieval routinely surfaces plausible, on-topic, wrong chunks. The eval set includes questions where the top-ranked context is relevant-looking but does not contain the answer.
 
 ---
 
@@ -157,6 +173,7 @@ src/
   chunker.py       PDF to cleaned text to overlapping chunks
   embedder.py      text to normalised vectors (MPS-accelerated)
   store.py         ChromaDB persistence and k-NN search
+  ingest.py        chunk, embed, and load the corpus
   generate.py      retrieved context + question to grounded answer
   app.py           FastAPI service
 eval/
@@ -176,6 +193,7 @@ data/chroma/       vector store (not committed, regenerable)
 - The eval set is hand-written and small, so differences of a few points are not meaningful.
 - Faithfulness scoring uses LLM-as-judge, which is imperfect and correlated with the generator.
 - Chunks exceeding the embedder's 512-token limit are silently truncated.
+- At 224 chunks Chroma uses exact search; results may shift once approximate nearest-neighbour indexing kicks in at scale.
 
 ---
 
