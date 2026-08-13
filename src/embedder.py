@@ -10,7 +10,7 @@ class Embedder:
         self.model_name = model_name
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         self.model = SentenceTransformer(model_name, device=self.device)
-        self.dim = self.model.get_sentence_embedding_dimension()
+        self.dim = self.model.get_embedding_dimension()
 
     def encode(self, texts: List[str], batch_size: int = 32,
                show_progress: bool = True) -> List[List[float]]:
