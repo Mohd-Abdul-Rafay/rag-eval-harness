@@ -4,7 +4,9 @@ A retrieval-augmented generation pipeline over a corpus of computer vision paper
 
 Runs entirely locally. No API keys, no paid services.
 
-> **Status:** in progress. Full pipeline working end to end — ingestion, embedding, vector search, and grounded generation. Evaluation harness and controlled comparison in development. Findings below come from real runs, including the ones that didn't work.
+**Measured baseline: recall@1 is 28%.** Details below.
+
+> **Status:** in progress. Pipeline works end to end and the 45-question eval set is verified against the corpus. The scoring harness and controlled comparison are in development. Findings below come from real runs, including the ones that didn't work.
 
 ---
 
@@ -15,7 +17,7 @@ A single end-to-end accuracy number tells you a RAG system failed without tellin
 - **Retrieval failed** — the answer was never in the context. Fix chunking, embeddings, or `k`.
 - **Generation failed** — the answer was in the context and the model ignored it, or blended it with parametric knowledge. Fix the prompt or the model.
 
-This is not a theoretical concern here. **Finding 3 below is a case where retrieval ranked the correct chunk second behind an unrelated one, and generation recovered anyway** — end-to-end accuracy was 1.0 while `recall@1` was 0. A single aggregate number would have reported success and hidden a real retrieval problem.
+This is not theoretical here. **Finding 3 is a case where retrieval ranked the correct chunk second behind an unrelated one and generation recovered anyway** — end-to-end accuracy 1.0, `recall@1` 0. A single aggregate number would have reported success and hidden a real retrieval problem.
 
 ---
 
@@ -61,13 +63,45 @@ done
 cd ../..
 ```
 
-Ingest, query, inspect:
+Run:
 
 ```bash
-python -m src.ingest --reset
-python -m src.generate
-python -m eval.inspect --search "your question here" -k 5
+python -m src.ingest --reset          # chunk, embed, store
+python -m src.generate                # end-to-end demo queries
+python -m eval.verify                 # check gold ids and preview recall
+python -m eval.inspect --search "..." # browse the corpus
 ```
+
+---
+
+## The eval set
+
+45 hand-written questions in `eval/questions.jsonl`, each with a known gold chunk, a reference answer, and a type.
+
+| Type | Count | Purpose |
+|---|---|---|
+| `answerable` | 28 | Normal case — the answer sits in one identifiable chunk |
+| `distractor` | 8 | Answer exists, but other chunks look more relevant |
+| `unanswerable` | 9 | Tests abstention; includes near-misses where the right paper is present but the fact is not |
+
+Questions are phrased as a user would ask them, never copied from the papers. Copying source wording makes retrieval trivially easy and the resulting metrics meaningless.
+
+**Gold IDs were verified, not assumed.** An initial pass flagged 17 questions whose gold chunk did not appear in the top 20. Manual inspection showed 13 were mislabelled by me and 4 were genuine retrieval failures. `eval/verify.py` re-runs this check; `eval/fix_gold.py` records the corrections that were applied. Unverified ground truth would have made every number below wrong.
+
+---
+
+## Baseline results
+
+Dense retrieval, `all-MiniLM-L6-v2`, chunk size 512, overlap 50, references stripped. 32 questions with verified gold chunks:
+
+| Metric | Result |
+|---|---|
+| **recall@1** | **9/32 (28%)** |
+| **recall@5** | **18/32 (56%)** |
+| recall@20 | 32/32 (100%) |
+| Gold absent from top 20 | 4/36 (11%) |
+
+Nearly three-quarters of questions fail to put the correct chunk first, and almost half fail at *k*=5. But every gold chunk that is found at all appears within the top 20 — the information is retrievable and the **ranking** is the problem. That profile is what reranking exists to fix, and it is the central hypothesis the comparison below tests.
 
 ---
 
@@ -75,9 +109,7 @@ python -m eval.inspect --search "your question here" -k 5
 
 ### Chunking
 
-Recursive character splitting on paragraph, line, sentence, then word boundaries, with configurable overlap. Chunk size is a **variable in the comparison below**, not a value copied from a tutorial, because the tradeoff is real: small chunks retrieve precisely but sever context; large chunks preserve context but produce embeddings averaged over too many ideas.
-
-Corpus at `chunk_size=512, overlap=50`, references stripped:
+Recursive character splitting on paragraph, line, sentence, then word boundaries, with configurable overlap. Chunk size is a **variable in the comparison**, not a value copied from a tutorial, because the tradeoff is real: small chunks retrieve precisely but sever context; large chunks preserve context but produce embeddings averaged over too many ideas.
 
 ```
 papers: 10
@@ -86,15 +118,13 @@ avg words/chunk: 415
 min: 63   max: 562
 ```
 
-The average falls below target because the splitter respects paragraph boundaries rather than cutting at an exact word count. The max exceeds target because overlap is prepended after splitting — worth noting, since 562 words is roughly 730 tokens and the embedder truncates at 512.
+The average falls below target because the splitter respects paragraph boundaries. The max exceeds target because overlap is prepended after splitting — 562 words is roughly 730 tokens and the embedder truncates at 512.
 
 ### Embedding
 
-`all-MiniLM-L6-v2`, 384 dimensions, running on Apple MPS. Vectors are normalised so cosine similarity reduces to a dot product.
+`all-MiniLM-L6-v2`, 384 dimensions, on Apple MPS. Vectors normalised so cosine similarity reduces to a dot product.
 
 **Finding 1 — the baseline embedder does not separate in-domain topics well.**
-
-Cosine similarity across four probe sentences:
 
 |  | s0 | s1 | s2 | s3 |
 |---|---|---|---|---|
@@ -103,13 +133,11 @@ Cosine similarity across four probe sentences:
 | **s2** transformer self-attention | 0.168 | 0.070 | 1.000 | 0.258 |
 | **s3** residual connections | 0.413 | 0.453 | 0.258 | 1.000 |
 
-The intended result is visible: **s0 to s1 scores 0.463** despite near-zero vocabulary overlap, which is the case for dense retrieval over keyword search.
-
-The unintended result is more useful. **s1 to s3 scores 0.453** — "residual connections allow training of very deep networks" is judged nearly as relevant to the U-Net question as the actually-correct answer, despite being unrelated. A 6-layer general-purpose embedder appears to encode *topic* ("this is a deep learning sentence") more strongly than the specific semantic relation being asked about.
+The intended result is visible: **s0–s1 = 0.463** despite near-zero vocabulary overlap. The unintended result is more useful: **s1–s3 = 0.453**, meaning "residual connections allow training of very deep networks" is judged nearly as relevant to the U-Net question as the correct answer. The embedder encodes *topic* more strongly than the specific semantic relation.
 
 ### Vector store and retrieval
 
-ChromaDB with a persistent local client, cosine space. Chroma returns cosine *distance*; the store converts to similarity explicitly, since getting that inversion wrong would silently reverse every ranking.
+ChromaDB, persistent local client, cosine space. Chroma returns cosine *distance*; the store converts to similarity explicitly, since inverting that would silently reverse every ranking.
 
 **Finding 2 — the probe-level failure reproduces in the full pipeline.**
 
@@ -117,46 +145,40 @@ Top-5 for *"How does U-Net handle limited training data?"*:
 
 | Rank | Similarity | Source | Relevant |
 |---|---|---|---|
-| 1 | 0.504 | ResNet #9 | No — convergence rates, optimization difficulty |
-| 2 | 0.502 | **U-Net #1** | **Yes** — "thousands of training images are usually beyond reach in biomedical tasks" |
+| 1 | 0.504 | ResNet #9 | No — convergence rates |
+| 2 | 0.502 | **U-Net #1** | **Yes** |
 | 3 | 0.489 | SimCLR #13 | No — results table |
 | 4 | 0.486 | ResNet #14 | No — 110-layer convergence |
-| 5 | 0.451 | U-Net #7 | Partial — reference section |
+| 5 | 0.451 | U-Net #7 | Partial |
 
-The correct chunk ranks **second, behind an unrelated ResNet chunk, by 0.002**. `recall@1` is 0 for this query while `recall@5` is 1. Two ResNet chunks appear in the top five for a question about U-Net and training data, and the total spread across the top five is 0.053 — the embedder is barely discriminating between relevant and irrelevant in-domain text.
+The correct chunk ranks second by 0.002. The spread across the whole top five is 0.053 — the embedder is barely discriminating.
 
 ### Grounded generation
 
-Llama 3.1 8B via Ollama at `temperature=0`. The system prompt requires the model to answer only from numbered context passages, cite passage numbers per claim, and emit `INSUFFICIENT_CONTEXT` when the context cannot support an answer. Citations exist so unsupported claims are visible to the faithfulness metric.
+Llama 3.1 8B at `temperature=0`. The system prompt requires answering only from numbered passages, citing passage numbers per claim, and emitting `INSUFFICIENT_CONTEXT` when the context cannot support an answer. Citations make unsupported claims visible to the faithfulness metric.
 
-**Finding 3 — generation compensated for a retrieval failure, which is the case for separate metrics.**
+**Finding 3 — generation compensated for a retrieval failure.**
 
-On the U-Net query above, the correct chunk was ranked second behind a higher-scoring ResNet chunk. The model ignored the top-ranked passage and cited [2] correctly:
+On the U-Net query, the model ignored the top-ranked ResNet passage and cited the correct one:
 
-> According to [2], the U-Net architecture can handle very few training images. It is able to yield more precise segmentations and has a reasonable training time of only 10 hours on a NVidia Titan GPU.
+> According to [2], the U-Net architecture can handle very few training images...
 
-End-to-end this looks like success. Measured separately, `recall@1` is 0 — retrieval failed and generation covered for it. Reporting only end-to-end accuracy would have hidden that entirely.
+End-to-end this looks like success while `recall@1` is 0. The answer is also incomplete — it names the outcome but not the mechanism (elastic deformation), which sat in a lower-ranked chunk and went uncited.
 
-The answer is also incomplete: it names the outcome but not the mechanism (elastic deformation and data augmentation), which appeared only partially in a lower-ranked chunk and went uncited. Retrieval surfaced the right *topic* without the specific supporting passage.
+**Finding 4 — abstention held under plausible-but-wrong context.**
 
-**Finding 4 — abstention held under plausible-but-wrong context, and retrieval scores signalled the out-of-corpus case.**
-
-Asked *"What learning rate schedule did the DreamGaussian paper use?"* — a paper not in the corpus — retrieval returned five confident-looking CV passages including the Transformer paper's warmup schedule. The model emitted `INSUFFICIENT_CONTEXT` and named what was missing rather than assembling an answer from the wrong papers.
-
-Retrieval similarity also separated the two cases:
+Asked about a paper not in the corpus, retrieval returned five confident-looking CV passages including the Transformer's warmup schedule. The model emitted `INSUFFICIENT_CONTEXT` and named what was missing.
 
 | Question type | Top-1 similarity |
 |---|---|
 | Answerable from corpus | 0.50 |
 | Not in corpus | 0.45 |
 
-The margin is small but consistent, suggesting a score threshold could act as a cheap pre-generation filter. Added to the comparison below as a testable variant.
+The margin is small but consistent, so a score threshold is added to the comparison as a testable pre-generation filter.
 
 ### Ingestion hygiene
 
-Inspecting chunks revealed that reference sections were being embedded as ordinary content. One U-Net chunk was 433 words consisting of a single line of body text followed by fourteen numbered citations and two URLs, and it had placed 5th for the U-Net query. Reference sections name every topic in a field without discussing any of them, so the hypothesis was that they embed as broadly relevant and displace real content.
-
-`strip_references()` cuts from the references/acknowledgements heading onward, restricted to the last 40% of a document so that in-body mentions are not matched. Controlled with `--keep-refs`.
+Chunk inspection revealed reference sections embedded as ordinary content — one U-Net chunk was 433 words consisting of one line of body text followed by fourteen citations, and it had placed 5th for the U-Net query. `strip_references()` cuts from the references heading onward, restricted to the last 40% of a document.
 
 **Finding 5 — removing 16% of the corpus as noise did not change retrieval.**
 
@@ -165,33 +187,47 @@ Inspecting chunks revealed that reference sections were being embedded as ordina
 | References kept | 224 | 421 |
 | References stripped | **188** | 415 |
 
-Same query, before and after:
-
 | Rank | Before | After |
 |---|---|---|
 | 1 | 0.504 ResNet #9 | 0.504 ResNet #9 |
 | 2 | 0.502 **U-Net #1** | 0.502 **U-Net #1** |
 | 3 | 0.489 SimCLR #13 | 0.489 SimCLR #13 |
 | 4 | 0.486 ResNet #14 | 0.486 ResNet #14 |
-| 5 | 0.451 U-Net #7 *(references)* | 0.441 ResNet #13 *(CIFAR results table)* |
+| 5 | 0.451 U-Net #7 *(refs)* | 0.441 ResNet #13 *(results table)* |
 
-Ranks 1 through 4 are identical to three decimal places. The bibliography chunk was evicted from position 5 and replaced by a ResNet CIFAR-10 results table — also irrelevant to the question.
+Ranks 1–4 identical to three decimals. The bibliography chunk was evicted and replaced by an equally irrelevant results table. The intervention did exactly what it was designed to do and produced no measurable improvement, because removing noise does not help when the remaining pool is equally irrelevant. The change is retained — 16% fewer vectors at no cost to ranking — but it rules out the cheap explanation.
 
-The intervention did exactly what it was designed to do and produced no measurable improvement, because removing noise from the candidate pool does not help when the remaining pool contains equally irrelevant candidates. The bottleneck is the embedder's discrimination, not corpus hygiene.
+### Eval set verification
 
-The change is retained: 16% fewer vectors at no cost to ranking is worth having. But it rules out the cheap explanation and confirms that the embedding-model, hybrid-retrieval, and reranking variants are the experiment that matters.
+**Finding 6 — the embedder repeatedly fails to match exact terminology.**
 
-### Evaluation harness — *in progress*
+Three independent cases surfaced while locating gold chunks:
+
+| Query | Target chunk contains | Result |
+|---|---|---|
+| "layer normalization before every block" | *"Layernorm (LN) is applied before every block"* verbatim | Gold absent from top 5 |
+| "hierarchical feature maps various scales backbone" | *"constructs hierarchical feature maps"* verbatim | Zero Swin chunks returned; five EfficientNet chunks instead |
+| "elastic deformation random displacement" | Section 3.1 Data Augmentation | Gold ranked #1 (0.440) — but the natural-language version of the same question drops it out of the top 20 entirely |
+
+The layernorm chunk additionally ranked **3rd for an unrelated query about projection heads**. The embedder fails on near-identical text and succeeds on unrelated text.
+
+This is the strongest argument in the project for hybrid retrieval: a BM25 sparse index would match these terms exactly and trivially. Dense retrieval alone is losing information that keyword search would preserve.
+
+**Finding 7 — two augmentation questions each retrieve the other paper's augmentation content.**
+
+q002 (U-Net augmentation) returns three SimCLR chunks. q017 (SimCLR augmentation) returns three *other* SimCLR chunks, not its own ablation. The embedder appears to hold "augmentation" as a topic direction without distinguishing whose augmentation is being discussed — consistent with Finding 1 at corpus scale.
+
+### Scoring harness — *in progress*
 
 ---
 
 ## Planned comparison
 
-One variable at a time, everything else fixed, so any difference is attributable to a single change.
+One variable at a time, everything else fixed, so any difference is attributable to a single change. Baseline row is measured; the rest are pending.
 
 | Variant | Chunk size | Top-k | Retrieval | recall@1 | recall@5 | MRR | Faithfulness | Abstention |
 |---|---|---|---|---|---|---|---|---|
-| Baseline | 512 | 5 | dense (MiniLM) | — | — | — | — | — |
+| **Baseline** | 512 | 5 | dense (MiniLM) | **28%** | **56%** | — | — | — |
 | Chunk 256 | 256 | 5 | dense (MiniLM) | — | — | — | — | — |
 | Chunk 1024 | 1024 | 5 | dense (MiniLM) | — | — | — | — | — |
 | Top-k 3 | 512 | 3 | dense (MiniLM) | — | — | — | — | — |
@@ -201,22 +237,22 @@ One variable at a time, everything else fixed, so any difference is attributable
 | Hybrid (RRF) | 512 | 5 | dense + BM25 | — | — | — | — | — |
 | Hybrid + rerank | 512 | 5 | dense + BM25 + cross-encoder | — | — | — | — | — |
 | Score threshold | 512 | 5 | dense + similarity cutoff | — | — | — | — | — |
-| References kept | 512 | 5 | dense (MiniLM), no ref stripping | — | — | — | — | — |
+| References kept | 512 | 5 | dense, no ref stripping | — | — | — | — | — |
 
 ---
 
 ## Metrics
 
 **Retrieval**
-- `recall@k` — is the known source chunk in the top *k*? Reported at k=1 and k=5, since Findings 2 and 3 show those diverge.
-- `MRR` — mean reciprocal rank of the correct chunk.
+- `recall@k` — is a gold chunk in the top *k*? Reported at k=1 and k=5, since Findings 2 and 3 show these diverge sharply.
+- `MRR` — mean reciprocal rank of the highest-ranked gold chunk.
 
 **Generation**
 - **Faithfulness** — is every claim supported by the retrieved context?
 - **Answer relevance** — does it address the question asked?
-- **Abstention correctness** — when the context genuinely lacks the answer, does the model say so instead of inventing one?
+- **Abstention correctness** — when the context genuinely lacks the answer, does the model say so?
 
-Abstention is measured deliberately. Llama 3.1 8B abstains correctly on unknown-entity questions even *without* retrieval — asked about a nonexistent paper it replied that the work "may not exist at all." The failure mode that matters in RAG is different, and Finding 2 shows why: retrieval routinely surfaces plausible, on-topic, wrong chunks. The eval set includes questions where the top-ranked context is relevant-looking but does not contain the answer.
+Abstention is measured deliberately. Llama 3.1 8B abstains correctly on unknown-entity questions even *without* retrieval. The failure mode that matters in RAG is different, and Findings 2 and 6 show why: retrieval routinely surfaces plausible, on-topic, wrong chunks. Nine eval questions target exactly this, including cases where the correct paper is in the corpus but the specific fact is not.
 
 ---
 
@@ -231,8 +267,10 @@ src/
   generate.py      retrieved context + question to grounded answer
   app.py           FastAPI service
 eval/
-  inspect.py       browse and search chunks when writing the eval set
-  questions.jsonl  hand-written eval set with known source chunks
+  questions.jsonl  45 hand-written questions with verified gold chunks
+  verify.py        checks gold ids exist and are retrievable; previews recall
+  fix_gold.py      records the gold id corrections applied after verification
+  inspect.py       browse and search chunks
   metrics.py       retrieval + generation metrics
   run.py           runs one config, logs per-variant results
   configs/         one YAML per variant
@@ -245,11 +283,11 @@ data/chroma/       vector store (not committed, regenerable)
 ## Limitations
 
 - Corpus is 10 papers in one domain; results may not transfer to heterogeneous corpora.
-- The eval set is hand-written and small, so differences of a few points are not meaningful.
-- Faithfulness scoring uses LLM-as-judge, which is imperfect and correlated with the generator.
+- 32 scoreable questions is small — differences of a few points are not meaningful.
+- Faithfulness scoring will use LLM-as-judge, which is imperfect and correlated with the generator.
 - Chunks exceeding the embedder's 512-token limit are silently truncated.
 - At 188 chunks Chroma uses exact search; results may shift once approximate nearest-neighbour indexing kicks in at scale.
-- Findings 2 through 5 are single-query observations, not measured rates. Quantifying them across the full eval set is the purpose of the harness.
+- Gold chunks were assigned by hand. Where an answer is spread across adjacent chunks, a single gold id understates recall.
 
 ---
 
