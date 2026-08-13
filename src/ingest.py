@@ -15,10 +15,14 @@ def main():
     ap.add_argument("--collection", default="papers")
     ap.add_argument("--reset", action="store_true",
                     help="drop the collection before ingesting")
+    ap.add_argument("--keep-refs", action="store_true",
+                    help="keep reference sections (default: strip them)")
     args = ap.parse_args()
 
-    print(f"chunking {args.papers} (size={args.chunk_size}, overlap={args.overlap})")
-    records = chunk_corpus(Path(args.papers), args.chunk_size, args.overlap)
+    print(f"chunking {args.papers} (size={args.chunk_size}, overlap={args.overlap}, "
+          f"refs={'kept' if args.keep_refs else 'stripped'})")
+    records = chunk_corpus(Path(args.papers), args.chunk_size, args.overlap,
+                           drop_refs=not args.keep_refs)
     print(f"  {len(records)} chunks")
 
     store = VectorStore(collection_name=args.collection)

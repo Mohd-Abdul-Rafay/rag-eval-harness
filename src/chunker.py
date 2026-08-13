@@ -25,6 +25,30 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def strip_references(text: str) -> str:
+    """
+    Cut everything from the references/bibliography heading onward.
+
+    Reference sections mention every topic in a field without discussing any
+    of them, so they embed as broadly relevant and answer nothing. Only cuts
+    in the last 40% of the document, since papers sometimes use these words
+    in body text.
+    """
+    patterns = [
+        r"\nReferences\s*\n",
+        r"\nREFERENCES\s*\n",
+        r"\nBibliography\s*\n",
+        r"\nAcknowledg(?:e)?ments?\s*\n",
+    ]
+    cut = len(text)
+    for pat in patterns:
+        for m in re.finditer(pat, text):
+            if m.start() > len(text) * 0.6:
+                cut = min(cut, m.start())
+                break
+    return text[:cut]
+
+
 def split_text(text: str, chunk_size: int = 512, overlap: int = 50) -> List[str]:
     """
     Recursive character splitting.
@@ -74,12 +98,14 @@ def split_text(text: str, chunk_size: int = 512, overlap: int = 50) -> List[str]
 
 
 def chunk_corpus(papers_dir: Path, chunk_size: int = 512,
-                 overlap: int = 50) -> List[Dict]:
+                 overlap: int = 50, drop_refs: bool = True) -> List[Dict]:
     """Load every PDF in a directory and return chunks with metadata."""
     records = []
     for pdf_path in sorted(papers_dir.glob("*.pdf")):
         raw = load_pdf(pdf_path)
         cleaned = clean_text(raw)
+        if drop_refs:
+            cleaned = strip_references(cleaned)
         chunks = split_text(cleaned, chunk_size, overlap)
         for i, chunk in enumerate(chunks):
             records.append({
@@ -93,15 +119,11 @@ def chunk_corpus(papers_dir: Path, chunk_size: int = 512,
 
 if __name__ == "__main__":
     papers = Path("data/papers")
-    records = chunk_corpus(papers)
 
-    print(f"papers: {len(list(papers.glob('*.pdf')))}")
-    print(f"chunks: {len(records)}")
-
-    lengths = [len(r["text"].split()) for r in records]
-    print(f"avg words/chunk: {sum(lengths) / len(lengths):.0f}")
-    print(f"min: {min(lengths)}  max: {max(lengths)}")
-
-    print("\n--- sample chunk ---")
-    print(records[5]["id"])
-    print(records[5]["text"][:400])
+    for drop in (False, True):
+        records = chunk_corpus(papers, drop_refs=drop)
+        lengths = [len(r["text"].split()) for r in records]
+        label = "refs stripped" if drop else "refs kept"
+        print(f"[{label}]  chunks: {len(records)}  "
+              f"avg words: {sum(lengths) / len(lengths):.0f}  "
+              f"min: {min(lengths)}  max: {max(lengths)}")
