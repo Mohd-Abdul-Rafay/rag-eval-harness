@@ -4,7 +4,7 @@ A retrieval-augmented generation pipeline over a corpus of computer vision paper
 
 Runs entirely locally. No API keys, no paid services.
 
-> **Status:** in progress. Ingestion, embedding, and vector search complete; generation and the evaluation harness in development. Findings below come from real runs, not expectations.
+> **Status:** in progress. Full pipeline working end to end — ingestion, embedding, vector search, and grounded generation. Evaluation harness and controlled comparison in development. Findings below come from real runs.
 
 ---
 
@@ -15,7 +15,7 @@ A single end-to-end accuracy number tells you a RAG system failed without tellin
 - **Retrieval failed** — the answer was never in the context. Fix chunking, embeddings, or `k`.
 - **Generation failed** — the answer was in the context and the model ignored it, or blended it with parametric knowledge. Fix the prompt or the model.
 
-Conflating them means guessing. So retrieval is measured with `recall@k` and MRR against known source chunks, and generation is measured for faithfulness and abstention correctness given the retrieved context.
+This is not a theoretical concern in this project. **Finding 3 below is a case where retrieval ranked the correct chunk second behind an unrelated one, and generation recovered anyway** — end-to-end accuracy was 1.0 while `recall@1` was 0. A single aggregate number would have reported success and hidden a real retrieval problem.
 
 ---
 
@@ -61,10 +61,11 @@ done
 cd ../..
 ```
 
-Ingest:
+Ingest and query:
 
 ```bash
 python -m src.ingest --reset
+python -m src.generate
 ```
 
 ---
@@ -121,13 +122,34 @@ Top-5 for *"How does U-Net handle limited training data?"*:
 | 4 | 0.486 | ResNet (1512.03385) #14 | No — 110-layer convergence |
 | 5 | 0.451 | U-Net (1505.04597) #7 | Partial — elastic deformation |
 
-The correct chunk ranks **second, behind an unrelated ResNet chunk, by 0.002**. `recall@1` is 0 for this query while `recall@5` is 1 — which is precisely why retrieval is measured at multiple values of *k* rather than reported as a single hit rate.
+The correct chunk ranks **second, behind an unrelated ResNet chunk, by 0.002**. `recall@1` is 0 for this query while `recall@5` is 1. Two ResNet chunks appear in the top five for a question about U-Net and training data, and the total spread across the top five is 0.053 — the embedder is barely discriminating between relevant and irrelevant in-domain text.
 
-Two ResNet chunks appear in the top five for a question about U-Net and training data. The total spread across the top five is 0.053, indicating the embedder is barely discriminating between relevant and irrelevant in-domain text.
+### Grounded generation
 
-These two findings motivate the retrieval variants tested below: a larger embedding model (`all-mpnet-base-v2`), sparse BM25 retrieval to recover exact-term matching, hybrid fusion, and cross-encoder reranking, which scores query and candidate jointly rather than embedding them independently.
+Llama 3.1 8B via Ollama at `temperature=0`. The system prompt requires the model to answer only from numbered context passages, cite passage numbers per claim, and emit `INSUFFICIENT_CONTEXT` when the context cannot support an answer. Citations exist so that unsupported claims are visible to the faithfulness metric.
 
-### Generation — *in progress*
+**Finding 3 — generation compensated for a retrieval failure, which is the case for separate metrics.**
+
+On the U-Net query above, the correct chunk was ranked second behind a higher-scoring ResNet chunk. The model ignored the top-ranked passage and cited [2] correctly:
+
+> According to [2], the U-Net architecture can handle very few training images. It is able to yield more precise segmentations and has a reasonable training time of only 10 hours on a NVidia Titan GPU.
+
+End-to-end this looks like success. Measured separately, `recall@1` is 0 — retrieval failed and generation covered for it. Reporting only end-to-end accuracy would have hidden that entirely.
+
+The answer is also incomplete: it names the outcome but not the mechanism (elastic deformation and data augmentation), which appeared only partially in chunk [5] and went uncited. Retrieval surfaced the right *topic* without the specific supporting passage.
+
+**Finding 4 — abstention held under plausible-but-wrong context, and retrieval scores signalled the out-of-corpus case.**
+
+Asked *"What learning rate schedule did the DreamGaussian paper use?"* — a paper not in the corpus — retrieval returned five confident-looking CV passages including the Transformer paper's warmup schedule. The model emitted `INSUFFICIENT_CONTEXT` and named what was missing rather than assembling an answer from the wrong papers.
+
+Retrieval similarity also separated the two cases:
+
+| Question type | Top-1 similarity |
+|---|---|
+| Answerable from corpus | 0.50 |
+| Not in corpus | 0.45 |
+
+The margin is small but consistent, suggesting a score threshold could act as a cheap pre-generation filter. This is testable and is added to the comparison below.
 
 ### Evaluation harness — *in progress*
 
@@ -148,13 +170,14 @@ One variable at a time, everything else fixed, so any difference is attributable
 | BM25 only | 512 | 5 | sparse | — | — | — | — | — |
 | Hybrid (RRF) | 512 | 5 | dense + BM25 | — | — | — | — | — |
 | Hybrid + rerank | 512 | 5 | dense + BM25 + cross-encoder | — | — | — | — | — |
+| Score threshold | 512 | 5 | dense + similarity cutoff | — | — | — | — | — |
 
 ---
 
 ## Metrics
 
 **Retrieval**
-- `recall@k` — is the known source chunk in the top *k*? Reported at k=1 and k=5, since Finding 2 shows those can diverge.
+- `recall@k` — is the known source chunk in the top *k*? Reported at k=1 and k=5, since Findings 2 and 3 show those diverge.
 - `MRR` — mean reciprocal rank of the correct chunk.
 
 **Generation**
@@ -162,7 +185,7 @@ One variable at a time, everything else fixed, so any difference is attributable
 - **Answer relevance** — does it address the question asked?
 - **Abstention correctness** — when the context genuinely lacks the answer, does the model say so instead of inventing one?
 
-Abstention is measured deliberately. Llama 3.1 8B abstains correctly on unknown-entity questions *without* retrieval — asked about a nonexistent paper, it replied that the work "may not exist at all." The failure mode that matters in RAG is different, and Finding 2 shows why: retrieval routinely surfaces plausible, on-topic, wrong chunks. The eval set includes questions where the top-ranked context is relevant-looking but does not contain the answer.
+Abstention is measured deliberately. Llama 3.1 8B abstains correctly on unknown-entity questions even *without* retrieval — asked about a nonexistent paper it replied that the work "may not exist at all." The failure mode that matters in RAG is different, and Finding 2 shows why: retrieval routinely surfaces plausible, on-topic, wrong chunks. The eval set includes questions where the top-ranked context is relevant-looking but does not contain the answer.
 
 ---
 
@@ -194,6 +217,7 @@ data/chroma/       vector store (not committed, regenerable)
 - Faithfulness scoring uses LLM-as-judge, which is imperfect and correlated with the generator.
 - Chunks exceeding the embedder's 512-token limit are silently truncated.
 - At 224 chunks Chroma uses exact search; results may shift once approximate nearest-neighbour indexing kicks in at scale.
+- Findings 3 and 4 are single-query observations, not measured rates. Quantifying them across the full eval set is the purpose of the harness.
 
 ---
 
